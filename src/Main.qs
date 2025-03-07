@@ -1,4 +1,4 @@
-// Distributed implmentation of Grover's search algorithm 
+// Distributed implementation of Grover's search algorithm 
 
 namespace DistGrover {
     open Microsoft.Quantum.Arrays;
@@ -6,7 +6,6 @@ namespace DistGrover {
     open Microsoft.Quantum.Measurement;
     open Microsoft.Quantum.Intrinsic;
     open Microsoft.Quantum.Diagnostics;
-    open DistGates.DistCNOT;
     open DistGates.DistMulticontrol;
     open Microsoft.Quantum.Convert;
 
@@ -18,56 +17,77 @@ namespace DistGrover {
         // QPUs minimizing the number of ebits.
         //
         // Input parameters:
-        //  - target: sequence to build Grover's oracle. Length defines number of computation qubits
+        //  - target: bitstring to build oracle. Length defines number of computation qubits
         //  - comp_qubits_node: number of computation qubits per QPU
-        //  - comm_qubits_node: (not implemented) number of communication qubits per QPU
         //  - max_nodes: number of QPUs the algorithm can use at most. It fails if more are required
-        //  - split: set to False to use 1 comp qubits + 1 comm qubits per node (e.g., NV-centers)
-        //      overrides comp_qubits_node, comm_qubits_node and max_nodes
-        //  - print_state: calls DumpState to print whole state. Only possible in simulation
+        //  - single_layer: execute a single layer of Grover's search algorithm, otherwise optimal
+        //  - print_state (DEBUG): calls DumpState to print whole state
+        //  - verbosity (DEBUG): level of verbosity (0: minimal, 1: standard; 2 debug)
         //
         // Output:
         //  - Result[] found after Grover's search using target to construct oracle
 
-        // let target = [
-        //     One, Zero, Zero, One, Zero, Zero, One, One,
-        //     Zero, Zero, One, One, Zero, Zero, One, Zero
-        // ];
-        
+
         let target = [
-            One, Zero, Zero, One, Zero, Zero, One, One, Zero
-        ];
+            One, Zero, Zero, One, Zero, Zero, One, One
+            ];  // 8-bit string (maximum size if split == False, runs quickly)
+        // let target = [
+        //     One, Zero, Zero, One, Zero, Zero, One, One, Zero, Zero, One, One
+        //     ];  // 12-bit string
+        // let target = [
+        //     One, Zero, Zero, One, Zero, Zero, One, One, Zero, Zero, One, One,
+        //     Zero, Zero, One, Zero, One, Zero
+        // ];  // 18-bit string (maximum size if split == True -> very slow!)
 
-        let (comp_qubits_node, comm_qubits_node, max_nodes) = (3, 1, 3);
+        let (comp_qubits_node, max_nodes) = (5, 5);
         let split = true;
+        let single_layer = false;
         let print_state = false;
+        let verbosity = 1;
 
-        Grover(target, comp_qubits_node, comm_qubits_node, max_nodes, split, print_state)
+        Grover(
+            target,
+            comp_qubits_node,
+            max_nodes,
+            split,
+            single_layer,
+            print_state,
+            verbosity
+        )
     }
 
     operation Grover(
-        target: Result[],
-        comp_qubits_node: Int,
-        comm_qubits_node: Int,
-        max_nodes: Int,
-        split: Bool,
-        print_state: Bool): Result[] {
+            target: Result[],
+            comp_qubits_node: Int,
+            max_nodes: Int,
+            split: Bool,
+            single_layer: Bool,
+            print_state: Bool,
+            verbosity: Int
+        ): Result[] {
+        // Wrapper for Grover's search using two distributed algorithms
 
-        // Wrapper for Grover's search using two distributed algorithms:
-        //  - if split == true -> use comp_qubits_node + comm_qubits_node qubits per node
-        //  - else -> use 1 comp qubits + 1 comm qubits per node (e.g., NV-centers)
-
+        // Define qubit registers
         use Qubits = Qubit[Length(target)];
 
-        mutable output = [Zero, size=Length(target)];
-        if split {
-            // Run Grover with comp_qubits_node qubits per node
-            set output = runDistGroverSplit(
-                Qubits, target, comp_qubits_node, comm_qubits_node, max_nodes, print_state);
+        // Set number of layers
+        mutable num_layers: Int = 0;
+        if single_layer {
+            set num_layers = 1;  // FOR DEBUG ONLY
         } else {
-            // Run Grover con 1 comp qubit + 1 comm qubit per node
-            set output = runDistGrover(Qubits, target, print_state);
+            set num_layers = Floor(PI()/4.*Sqrt(2.^IntAsDouble(Length(target)))-0.5);  // Optimal
         }
+        Message($"Running distributed Grover's search algorithm with {num_layers} layers");
+
+        let output = runDistGrover(
+            Qubits,
+            target,
+            comp_qubits_node,
+            max_nodes,
+            num_layers,
+            print_state,
+            verbosity
+        );
 
         // Reset and free qubits
         ResetAll(Qubits);
@@ -84,19 +104,29 @@ namespace DistGrover {
         return sum
     }
 
-    function calc_partition(total_qubits: Int, qubits_qpu: Int, max_qpus: Int): Int[] {
-        // Calculates optimal partition of QPUs
-        // Inputs:
-        //  - total_qubits: number of qubits to split across the QPUs
-        //  - qubits_qpu: number of qubits that the QPUs have
-        //  - max_qpus: maximum number of 
+    function calc_partition(
+            total_qubits: Int,
+            qubits_qpu: Int,
+            max_qpus: Int,
+            verbosity: Int
+        ): Int[] {
 
+        // Calculates optimal partition of QPUs
+        // Input parameters:
+        // - total_qubits: Int -> number of qubits to split across the QPUs
+        // - qubits_qpu: Int -> number of qubits that the QPUs have
+        // - max_qpus: Int -> maximum number of QPUs
+        // - verbosity: Int -> level of verbosity
+
+        // Check that simulation has enough computation qubits, otherwise fail
         if max_qpus*qubits_qpu < total_qubits {
             fail $"Cannot satisfy {total_qubits} in {max_qpus} QPUs of {qubits_qpu} qubits/QPU";
         }
 
+        // Calculate number of nodes needed, up to max_qpus
         let num_nodes = Ceiling(IntAsDouble(total_qubits)/IntAsDouble(qubits_qpu));
 
+        // Ensure the router needed is not larger than the number of nodes, otherwise fail
         if num_nodes > qubits_qpu {
             fail $"Router requires {num_nodes} qubits -> larger than QPUs";
         }
@@ -109,76 +139,65 @@ namespace DistGrover {
         }
         set node_qubits w/= num_nodes-1 <- qubits_left;
 
-        Message($"{num_nodes} nodes required");
-        Message($"{node_qubits} qubits in each node");
+        if verbosity >= 1 {
+            Message($"{num_nodes} nodes required with {node_qubits} computation qubits/node");
+        }
 
         return node_qubits;
     }
 
-    operation runDistGrover(Qubits: Qubit[], target: Result[], print_state: Bool): Result[] {
-        // Set number of layers
-        // let num_layers = 1;  // FOR DEBUG ONLY
-        let num_layers = Floor(PI()/4.*Sqrt(2.^IntAsDouble(Length(Qubits)))-0.5);  // Optimal
-        Message($"Running Grover's search algorithm with {num_layers} layers");
-
-        for q in Qubits {
-            X(q); H(q)
-        }
-        for l in 1..num_layers {
-            GroverLayer(Qubits, target)
-        }
-
-        // Print state (only simulation)
-        if print_state {DumpRegister(Qubits)}
-
-        // Measure qubits and compare result with target
-        let output = MeasureEachZ(Qubits);
-        Message($"Target: '{target}'");
-        return output
-    }
-
-    operation runDistGroverSplit(
+    operation runDistGrover(
             Qubits: Qubit[],
             target: Result[],
             computation_qubits_node: Int,
-            communication_qubits_node: Int,
             max_nodes: Int,
-            print_state: Bool): Result[] {
+            num_layers: Int,
+            print_state: Bool,
+            verbosity: Int
+        ): Result[] {
 
         // Set maximum number of qubits that can be simulated
-        let MAX_QUBITS_SIMULATION = 25;
+        let MAX_QUBITS_SIMULATION = 26;
 
         // Calculate the lowest ebit cost partition of the algorithm for the input parameters
-        let node_qubits = calc_partition(Length(Qubits), computation_qubits_node, max_nodes);
+        let node_qubits = calc_partition(
+            Length(target),
+            computation_qubits_node,
+            max_nodes,
+            verbosity);
 
         // Ensure qubits required fit in memory
-        let QUBITS_SIMULATION = (Sum(node_qubits) + Length(node_qubits)*communication_qubits_node);
+        let QUBITS_SIMULATION = (Sum(node_qubits) + 2*Length(node_qubits));
         if QUBITS_SIMULATION > MAX_QUBITS_SIMULATION {
             fail $"Too many qubits: {QUBITS_SIMULATION}";
         }
 
-        // Set number of layers
-        // let num_layers = 1;  // FOR DEBUG ONLY
-        let num_layers = Floor(PI()/4.*Sqrt(2.^IntAsDouble(Length(Qubits)))-0.5);  // Optimal
-        Message($"Running Grover's search algorithm with {num_layers} layers");
+        if verbosity >= 1 {
+            Message($"Length of bitstring: {Length(target)}");
+            Message($"Total number of qubits (inc. comm. qubits): {QUBITS_SIMULATION}");
+        }
 
         // Split qubits in nodes
         mutable Nodes = [Qubits[0..-1], size=Length(node_qubits)];
         set Nodes w/= 0 <- Qubits[0.. node_qubits[0]-1];
-        Message($"Node 0 - {node_qubits[0]} qubits: {Nodes[0]}");
+
         for i in 1..Length(node_qubits)-1 {
             set Nodes w/= i <- Qubits[
                 Sum(node_qubits[0..i-1]) .. Sum(node_qubits[0..i-1]) + node_qubits[i]-1]
         }
-        Message($"{Nodes}");
+
+        if verbosity >= 2 {Message($"Nodes: {Nodes}")}
 
         // Initialise state to |->^(n)
         for q in Qubits {
             X(q); H(q)
         }
 
+        // Execute Grover layer
         for i in 1..num_layers {
-            GroverLayerSplit(Nodes, target)
+            if verbosity >= 1 {Message($"Executing Grover layer {i}/{num_layers}")}
+
+            GroverLayer(Nodes, target, verbosity)
         }
 
         // Print state (only simulation)
@@ -186,40 +205,13 @@ namespace DistGrover {
 
         // Measure qubits and compare result with target
         let output = MeasureEachZ(Qubits);
-        Message($"Target: '{target}'");
+        Message($"Target: {target}");
+        Message($"Output: {output}");
         return output
     }
 
-    operation GroverLayer(Qubits: Qubit[], target: Result[]): () {
-        // Run a single layer of Grover's search. Oracle and diffusor use DistMCZ
-
-        // Assert that Qubit and target are of the same length, otherwise fail
-        if not (Length(Qubits) == Length(target)) {
-            fail $"Length(Qubits) {Length(Qubits)} != Length(target) {Length(target)}";
-        }
-
-        // Oracle
-        for (q, t) in Zipped(Qubits, target) {if not (t == One) {
-            X(q)}  // Flips qubits to construct oracle according to target
-        }
-        DistMCZ(Qubits);
-
-        for (q, t) in Zipped(Qubits, target) {
-            if not (t == One) {
-                X(q)  // Undo bit flips according to target
-            }
-            H(q)  // Change basis between oracle and diffusor
-        }
-
-        // Diffusor
-        DistMCZ(Qubits);
-        for q in Qubits {
-            H(q)  // Change basis between diffusor and oracle
-        }
-    }
-
-    operation GroverLayerSplit(Nodes: Qubit[][], target: Result[]): () {
-        // Run a single layer of Grover's search. Oracle and diffusor use SplitDistributedMCZ
+    operation GroverLayer(Nodes: Qubit[][], target: Result[], verbosity: Int): () {
+        // Run a single layer of Grover's search. Oracle and diffuser use SplitDistributedMCZ
 
         let Qubits = Flattened(Nodes);
 
@@ -228,23 +220,24 @@ namespace DistGrover {
             fail $"Length(Qubits) {Length(Qubits)} != Length(target) {Length(target)}";
         }
 
-        // Oracle
+        // ORACLE
+        if verbosity >= 2 {Message($"Executing Oracle")}
+
         for (q, t) in Zipped(Qubits, target) {if not (t == One) {
             X(q)}  // Flips qubits to construct oracle according to target
         }
-        SplitDistributedMCZ(Nodes);
+        DistributedMCZ(Nodes, verbosity);
 
-        for (q, t) in Zipped(Qubits, target) {
-            if not (t == One) {
-                X(q)  // Undo bit flips according to target
-            }
-            H(q)  // Change basis between oracle and diffusor
+        for (q, t) in Zipped(Qubits, target) {if not (t == One) {
+            X(q)}  // Undo bit flips according to target
         }
 
-        // Diffusor
-        SplitDistributedMCZ(Nodes);
-        for q in Qubits {
-            H(q)  // Change basis between diffusor and oracle
-        }
+        // DIFFUSER
+        if verbosity >= 2 {Message($"Executing Diffuser")}
+
+        for q in Qubits {H(q)}  // Change basis between diffuser and oracle}
+        DistributedMCZ(Nodes, verbosity);
+
+        for q in Qubits {H(q)}  // Change basis between diffuser and oracle}
     }
 }
