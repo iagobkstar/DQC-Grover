@@ -1,5 +1,5 @@
 ## Distributed Grover's search algorithm implementation
-Implementation from the paper I. F. Llovo, G. Díaz-Camacho, N. C. Lago and A. G. Tato, "Network-assisted collective operations for efficient distributed quantum computing," in IEEE Transactions on Quantum Engineering, dx.doi.org/10.1109/TQE.2025.3619387
+Implementation from the paper I. F. Llovo, G. Díaz-Camacho, N. C. Lago and A. G. Tato, "Network-assisted collective operations for efficient distributed quantum computing," in IEEE Transactions on Quantum Engineering, https://dx.doi.org/10.1109/TQE.2025.3619387
 
 This program demonstrates splitting and running Grover's search algorithm into multiple small-size QPUs using quantum communications to perform collective quantum gates between the QPUs. The program will automatically partition the collective gates into the smallest number of QPUs minimizing the number of ebits.
 
